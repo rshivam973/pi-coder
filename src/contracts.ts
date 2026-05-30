@@ -136,6 +136,7 @@ export type Phase =
   | "test"
   | "review"
   | "git"
+  | "discuss"
   | "done";
 
 /**

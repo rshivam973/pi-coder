@@ -159,4 +159,56 @@ describe("Session — scripted runs", () => {
     expect(state.review.passed).toBe(true);
     expect(state.finish?.status).toBe("success");
   });
+
+  test("stays alive for discussion after finishing, until stopped", async () => {
+    const workdir = tempRepo();
+    const events: PiEvent[] = [];
+    const { ctx, emitter, state, logger } = makeCtx(workdir, events);
+    const tools = createTools(ctx);
+    const controller = new AbortController();
+
+    let onFinishCalls = 0;
+    const onFinish = async () => {
+      onFinishCalls++;
+      return { prUrl: "https://github.com/acme/widgets/pull/1" };
+    };
+
+    // Scripted control: discussion phase asks one question, then stops.
+    let wi = 0;
+    const waits: { type: string; text?: string }[] = [
+      { type: "chat", text: "Why did you change that function?" },
+      { type: "stop" },
+    ];
+    const control = {
+      drain: () => [] as never[],
+      waitForNext: () => Promise.resolve((waits[wi++] ?? { type: "stop" }) as never),
+      close: () => {},
+    };
+
+    const model = scriptedModel([
+      [toolCall("record_review", { passed: true, findings: [] })],
+      [toolCall("finish", { status: "success", summary: "Refactored the helper." })],
+      // discussion greeting (text only, no tool call → answer completes)
+      [{ type: "text-start", id: "g" }, { type: "text-delta", id: "g", delta: "Done! Ask me anything." }, { type: "text-end", id: "g" }],
+      // answer to the user's question (text only)
+      [{ type: "text-start", id: "a" }, { type: "text-delta", id: "a", delta: "Because it was buggy." }, { type: "text-end", id: "a" }],
+    ]);
+
+    const session = new Session({
+      model, tools, systemPrompt: "work", standbySystemPrompt: "discuss",
+      task, state, emitter, logger, control, signal: controller.signal,
+      startedAt: performance.now(), interactive: true, onFinish, standbyIdleSec: 30,
+    });
+
+    const result = await session.run();
+
+    expect(onFinishCalls).toBe(1); // PR opened exactly once, when work finished
+    expect(result.reason).toBe("stop_command"); // discussion ended by the user's stop
+    expect(state.finish?.status).toBe("success");
+
+    const types = events.map((e) => e.type);
+    expect(types).toContain("phase"); // includes the "discuss" phase transition
+    expect(events.some((e) => e.type === "phase" && e.phase === "discuss")).toBe(true);
+    expect(types.filter((t) => t === "llm_text").length).toBeGreaterThanOrEqual(2); // greeting + answer
+  });
 });

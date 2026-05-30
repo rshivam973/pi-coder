@@ -20,7 +20,7 @@ import { runPreflight } from "./init.ts";
 import { getModel } from "./providers.ts";
 import { loadSkills, SkillRegistry } from "./skills.ts";
 import { resolveProfile } from "./profiles.ts";
-import { buildSystemPrompt } from "./prompt.ts";
+import { buildSystemPrompt, buildStandbySystemPrompt } from "./prompt.ts";
 import { createRunState, createTools, type RunState, type ToolContext } from "./tools.ts";
 import { Session, type StopReason } from "./session.ts";
 import { ControlChannel, NullControlChannel, type ControlSource } from "./control.ts";
@@ -53,9 +53,11 @@ function makeDirs(): Dirs {
 
 /** Map the loop's stop reason + agent finish into the final result status. */
 function finalStatus(reason: StopReason, state: RunState): ResultStatus {
-  if (reason === "finished" && state.finish) return state.finish.status;
+  // If the agent finished the task, its declared status stands regardless of how
+  // the (optional) discussion phase later ended (stop_command / standby_idle).
+  if (state.finish) return state.finish.status;
   if (reason === "error") return "failed";
-  return "partial"; // stop_command, max_steps, timeout
+  return "partial"; // stop_command, max_steps, timeout without finishing
 }
 
 function blockedReasons(reason: StopReason, prFailed: boolean): string[] {
@@ -141,11 +143,61 @@ export async function runTask(opts: RunOptions): Promise<Result> {
     ? new NullControlChannel()
     : new ControlChannel({ onMalformed: (line) => emitter.error("bad_control", `ignored: ${line.slice(0, 80)}`, false) });
 
-  // --- run loop -----------------------------------------------------------
+  // Git context for finalize/PR — deliberately WITHOUT the work-phase abort
+  // signal, so committing/pushing/opening the PR can't be killed by the
+  // work-phase timeout (and runs safely after it during discussion mode).
+  const finalizeGitCtx = { cwd: workdir, logPath: join(dirs.logDir, "git.log") };
+
+  // --- finalize (commit/push/PR) — runs once, the moment work completes ----
+  let finalized = false;
+  let prUrl: string | null = null;
+  let prFailed = false;
+
+  const finalizeWork = async (): Promise<{ prUrl: string | null }> => {
+    if (finalized) return { prUrl };
+    finalized = true;
+    clearTimeout(timer); // work done — stop the work-phase timeout (discussion may run longer)
+    emitter.phase("git");
+    try {
+      const dirty = (await git.status(finalizeGitCtx)).trim().length > 0;
+      if (dirty) {
+        await git.commit({ message: `[agentic] issue-${task.issue_id}: work in progress (auto-commit)` }, finalizeGitCtx);
+      }
+      for (const f of await git.changedFiles(task.base_ref, finalizeGitCtx)) state.changedFiles.add(f);
+
+      if (state.changedFiles.size > 0) {
+        await git.push(branch, finalizeGitCtx);
+        emitter.emit({ type: "git", action: "push", detail: branch });
+
+        const stats = await git.diffStats(task.base_ref, finalizeGitCtx);
+        const preResult = buildResult({ task, state, dirs, reason: "finished", prUrl: null, blocked: [], diffStats: stats });
+        const gh = ghClient(task, token);
+        try {
+          const pr = await gh.createPullRequest({
+            head: branch,
+            base: task.github.pr_target_ref ?? task.base_ref,
+            title: buildPrTitle(task, preResult),
+            body: buildPrBody(task, preResult),
+          });
+          prUrl = pr.url;
+          emitter.emit({ type: "pr_created", url: pr.url, number: pr.number });
+        } catch (err) {
+          prFailed = true;
+          emitter.error("pr_failed", (err as Error).message, false);
+        }
+      }
+    } catch (err) {
+      emitter.error("finalize_failed", (err as Error).message, false);
+    }
+    return { prUrl };
+  };
+
+  // --- run loop (+ post-task discussion phase) ----------------------------
   const session = new Session({
     model,
     tools,
     systemPrompt,
+    standbySystemPrompt: buildStandbySystemPrompt(task),
     task,
     state,
     emitter,
@@ -153,6 +205,8 @@ export async function runTask(opts: RunOptions): Promise<Result> {
     control,
     signal: controller.signal,
     startedAt: performance.now(),
+    interactive: !opts.noInput,
+    onFinish: finalizeWork,
   });
 
   let reason: StopReason = "error";
@@ -166,45 +220,11 @@ export async function runTask(opts: RunOptions): Promise<Result> {
     control.close();
   }
 
-  // --- finalize -----------------------------------------------------------
-  emitter.phase("git");
-  let prUrl: string | null = null;
-  let prFailed = false;
+  // Cover the cases where the agent never reached finish (stop/timeout/max_steps
+  // during the work phase): commit + push + open a PR for whatever exists.
+  await finalizeWork();
 
-  try {
-    // Commit any work the agent left uncommitted (e.g. on stop/timeout).
-    const dirty = (await git.status(gitCtx)).trim().length > 0;
-    if (dirty) {
-      await git.commit({ message: `[agentic] issue-${task.issue_id}: work in progress (auto-commit)` }, gitCtx);
-    }
-    for (const f of await git.changedFiles(task.base_ref, gitCtx)) state.changedFiles.add(f);
-
-    if (state.changedFiles.size > 0) {
-      await git.push(branch, gitCtx);
-      emitter.emit({ type: "git", action: "push", detail: branch });
-
-      const stats = await git.diffStats(task.base_ref, gitCtx);
-      const preResult = buildResult({ task, state, dirs, reason, prUrl: null, blocked: [], diffStats: stats });
-      const gh = ghClient(task, token);
-      try {
-        const pr = await gh.createPullRequest({
-          head: branch,
-          base: task.github.pr_target_ref ?? task.base_ref,
-          title: buildPrTitle(task, preResult),
-          body: buildPrBody(task, preResult),
-        });
-        prUrl = pr.url;
-        emitter.emit({ type: "pr_created", url: pr.url, number: pr.number });
-      } catch (err) {
-        prFailed = true;
-        emitter.error("pr_failed", (err as Error).message, false);
-      }
-    }
-  } catch (err) {
-    emitter.error("finalize_failed", (err as Error).message, false);
-  }
-
-  return finalize({ task, state, dirs, emitter, logger, branch, reason, prUrl, prFailed, outputPath: opts.outputPath, gitCtx, baseRef: task.base_ref });
+  return finalize({ task, state, dirs, emitter, logger, branch, reason, prUrl, prFailed, outputPath: opts.outputPath, gitCtx: finalizeGitCtx, baseRef: task.base_ref });
 }
 
 function ghClient(task: Task, token: string): GitHubClient {
