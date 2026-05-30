@@ -1,0 +1,25 @@
+{
+  "task_id": "00000000-0000-0000-0000-000000000001",
+  "repo": "https://github.com/your-org/your-repo.git",
+  "base_ref": "main",
+  "issue_id": "ISSUE-123",
+  "instructions": "Fix the off-by-one bug in the pagination helper and add a regression test that covers the boundary case.",
+  "acceptance_criteria": "The test suite passes and a new test fails without the fix.",
+  "constraints": {
+    "max_steps": 40,
+    "max_runtime_sec": 1800,
+    "allow_network": true,
+    "allow_write": ["./src", "./test"]
+  },
+  "tool_profile": "auto",
+  "command_overrides": {},
+  "provider": {
+    "name": "openrouter",
+    "model": "anthropic/claude-sonnet-4",
+    "api_key_env": "OPENROUTER_API_KEY"
+  },
+  "github": {
+    "token_env": "GITHUB_TOKEN",
+    "pr_target_ref": "main"
+  }
+}
